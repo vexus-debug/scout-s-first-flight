@@ -648,6 +648,7 @@ function Scanner() {
       <RouteDetail
         opportunity={selected}
         fee={scanRequest?.fee ?? fee}
+        feeRates={scanRequest?.feeRates ?? feeRates}
         convertSpread={scanRequest?.convertSpread ?? convertSpread}
         fetchedAt={scanRequest?.market.fetchedAt ?? market?.fetchedAt}
         onClose={() => setSelected(null)}
