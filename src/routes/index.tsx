@@ -681,7 +681,7 @@ function formatUsd(value: number) {
 }
 
 /** Detailed per-leg walkthrough of one route, simulated with a $1 notional. */
-function RouteDetail({ opportunity, fee, convertSpread, fetchedAt, onClose }: { opportunity: Opportunity | null; fee: number; convertSpread: number; fetchedAt?: string | undefined; onClose: () => void }) {
+function RouteDetail({ opportunity, fee, feeRates, convertSpread, fetchedAt, onClose }: { opportunity: Opportunity | null; fee: number; feeRates: Record<string, number>; convertSpread: number; fetchedAt?: string | undefined; onClose: () => void }) {
   if (!opportunity) return null;
   const start = opportunity.assets[0] ?? "";
 
@@ -690,7 +690,7 @@ function RouteDetail({ opportunity, fee, convertSpread, fetchedAt, onClose }: { 
   let balance = 1;
   const steps = opportunity.legs.map((leg) => {
     const rate = leg.side === "Buy" ? 1 / leg.price : leg.side === "Sell" ? leg.price : leg.price;
-    const cost = leg.side === "Convert" ? convertSpread : fee;
+    const cost = leg.side === "Convert" ? convertSpread : (feeRates[leg.symbol] ?? fee);
     const before = balance;
     const gross = before * rate;
     const charged = gross * cost;
