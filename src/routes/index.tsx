@@ -230,6 +230,7 @@ function createScanPass(
   useConvert: boolean,
   convertSpread: number,
   universe: Universe,
+  feeRates: Record<string, number> = {},
 ) {
   // Universe filter: crypto drops xStocks/fiat; xstocks keeps only USDT-quoted xStocks; cross keeps all.
   instruments = instruments.filter(universeFilter[universe]);
