@@ -531,7 +531,7 @@ function Scanner() {
 
   useEffect(() => {
     if (!scanRequest) return;
-    const pass = createScanPass(scanRequest.market.instruments, scanRequest.market.tickers, scanRequest.fee, scanRequest.maxLegs, scanRequest.useConvert, scanRequest.convertSpread, scanRequest.universe);
+    const pass = createScanPass(scanRequest.market.instruments, scanRequest.market.tickers, scanRequest.fee, scanRequest.maxLegs, scanRequest.useConvert, scanRequest.convertSpread, scanRequest.universe, scanRequest.feeRates);
     const total = pass.steps.length;
     const best = new Map<string, Opportunity>();
     let cursor = 0;
