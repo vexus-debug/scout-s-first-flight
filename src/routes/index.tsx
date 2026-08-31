@@ -255,7 +255,13 @@ function createScanPass(
     const spotLegs = legs.filter((leg) => leg.side !== "Convert").length;
     const converts = legs.length - spotLegs;
     const gross = product - 1;
-    const net = product * Math.pow(1 - fee, spotLegs) * Math.pow(1 - convertSpread, converts) - 1;
+    // Per-symbol taker fee when the account fee tier is available, otherwise the global fee slider.
+    let feeFactor = 1;
+    for (const leg of legs) {
+      if (leg.side === "Convert") continue;
+      feeFactor *= 1 - (feeRates[leg.symbol] ?? fee);
+    }
+    const net = product * feeFactor * Math.pow(1 - convertSpread, converts) - 1;
     const assets = [start, ...legs.map((leg) => leg.to)];
     const stocks = new Set(assets.filter(isStockAsset)).size;
     return {
