@@ -435,6 +435,30 @@ function Scanner() {
 
   const scanningRef = useRef(false);
 
+  // Live Bybit account fee tier (per symbol) — falls back to the fee slider when unavailable.
+  const [feeRates, setFeeRates] = useState<Record<string, number>>({});
+  const [feeSource, setFeeSource] = useState<{ live: boolean; note: string }>({ live: false, note: "Modelled fee (slider)" });
+  // Live Convert spread measured from a real Bybit Convert quote.
+  const [convertSource, setConvertSource] = useState<{ live: boolean; note: string }>({ live: false, note: "Modelled spread (slider)" });
+  const [convertBusy, setConvertBusy] = useState(false);
+
+  const loadFees = useCallback(async () => {
+    try {
+      const result = await getBybitFeeRates();
+      if (result.configured) {
+        setFeeRates(result.rates);
+        setFee(result.defaultTaker);
+        setFeeSource({ live: true, note: `Live account fee tier · ${Object.keys(result.rates).length} symbols` });
+      } else {
+        setFeeRates({});
+        setFeeSource({ live: false, note: result.reason });
+      }
+    } catch {
+      setFeeRates({});
+      setFeeSource({ live: false, note: "Fee tier unavailable — using the slider value" });
+    }
+  }, []);
+
   const scan = useCallback(async () => {
     setLoading(true);
     try {
@@ -452,21 +476,16 @@ function Scanner() {
     }
   }, []);
 
-  useEffect(() => { void scan(); }, [scan]);
-  useEffect(() => {
-    if (!autoRefresh) return;
-    const timer = window.setInterval(() => { if (!scanningRef.current) void scan(); }, REFRESH_MS);
-    return () => window.clearInterval(timer);
-  }, [autoRefresh, scan]);
+  useEffect(() => { void scan(); void loadFees(); }, [scan, loadFees]);
 
   // Scanning is manual: a request snapshot is only created when the user hits "Scan now".
   // Work is time-sliced so the tab stays responsive while a full-universe pass runs.
   const [opportunities, setOpportunities] = useState<Opportunity[]>([]);
   const [progress, setProgress] = useState({ done: 0, total: 0, assets: 0 });
-  type ScanRequest = { market: MarketResponse; fee: number; maxLegs: number; useConvert: boolean; convertSpread: number; universe: Universe; id: number };
+  type ScanRequest = { market: MarketResponse; fee: number; maxLegs: number; useConvert: boolean; convertSpread: number; universe: Universe; feeRates: Record<string, number>; id: number };
   const [scanRequest, setScanRequest] = useState<ScanRequest | null>(null);
 
-  const settings = { fee, maxLegs, useConvert, convertSpread, universe };
+  const settings = { fee, maxLegs, useConvert, convertSpread, universe, feeRates };
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
   const marketRef = useRef(market);
@@ -478,6 +497,37 @@ function Scanner() {
     if (!source) return;
     setScanRequest({ market: source, ...settingsRef.current, id: Date.now() });
   }, [scan]);
+
+  // Auto refresh re-runs the full scan (not just the quote pull) so P/L stays current.
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const timer = window.setInterval(() => { if (!scanningRef.current) void runScan(); }, REFRESH_MS);
+    return () => window.clearInterval(timer);
+  }, [autoRefresh, runScan]);
+
+  /** Measure the real Convert spread against the spot mid using a live Bybit Convert quote. */
+  const calibrateConvert = useCallback(async () => {
+    const source = marketRef.current;
+    if (!source) return;
+    setConvertBusy(true);
+    try {
+      const ticker = source.tickers.find((item) => item.symbol === "BTCUSDT");
+      const mid = ticker ? (parseNumber(ticker.bid1Price) + parseNumber(ticker.ask1Price)) / 2 : 0;
+      const quote = await getBybitConvertQuote({ data: { fromCoin: "USDT", toCoin: "BTC", amount: 100 } });
+      if (!quote.ok || mid <= 0 || quote.rate <= 0) {
+        setConvertSource({ live: false, note: quote.ok ? "No spot reference for calibration" : quote.reason });
+        return;
+      }
+      const measured = Math.max(0, Math.min(0.05, 1 - quote.rate * mid));
+      setConvertSpread(measured);
+      setConvertSource({ live: true, note: `Live USDT→BTC Convert quote · ${(measured * 100).toFixed(3)}%` });
+    } catch {
+      setConvertSource({ live: false, note: "Convert quote unavailable — using the slider value" });
+    } finally {
+      setConvertBusy(false);
+    }
+  }, []);
+
 
   useEffect(() => {
     if (!scanRequest) return;
