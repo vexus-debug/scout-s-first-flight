@@ -3,6 +3,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { ArrowDown, ArrowUp, ChevronDown, CircleHelp, Clock3, ExternalLink, Gauge, GitBranch, Info, LayoutGrid, RefreshCw, Search, Settings2, SlidersHorizontal, Star, WalletCards, Zap } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { getBybitConvertQuote, getBybitFeeRates } from "@/lib/bybit.functions";
 
 type Instrument = {
   symbol: string;
@@ -230,6 +231,7 @@ function createScanPass(
   useConvert: boolean,
   convertSpread: number,
   universe: Universe,
+  feeRates: Record<string, number> = {},
 ) {
   // Universe filter: crypto drops xStocks/fiat; xstocks keeps only USDT-quoted xStocks; cross keeps all.
   instruments = instruments.filter(universeFilter[universe]);
@@ -254,7 +256,13 @@ function createScanPass(
     const spotLegs = legs.filter((leg) => leg.side !== "Convert").length;
     const converts = legs.length - spotLegs;
     const gross = product - 1;
-    const net = product * Math.pow(1 - fee, spotLegs) * Math.pow(1 - convertSpread, converts) - 1;
+    // Per-symbol taker fee when the account fee tier is available, otherwise the global fee slider.
+    let feeFactor = 1;
+    for (const leg of legs) {
+      if (leg.side === "Convert") continue;
+      feeFactor *= 1 - (feeRates[leg.symbol] ?? fee);
+    }
+    const net = product * feeFactor * Math.pow(1 - convertSpread, converts) - 1;
     const assets = [start, ...legs.map((leg) => leg.to)];
     const stocks = new Set(assets.filter(isStockAsset)).size;
     return {
@@ -428,6 +436,30 @@ function Scanner() {
 
   const scanningRef = useRef(false);
 
+  // Live Bybit account fee tier (per symbol) — falls back to the fee slider when unavailable.
+  const [feeRates, setFeeRates] = useState<Record<string, number>>({});
+  const [feeSource, setFeeSource] = useState<{ live: boolean; note: string }>({ live: false, note: "Modelled fee (slider)" });
+  // Live Convert spread measured from a real Bybit Convert quote.
+  const [convertSource, setConvertSource] = useState<{ live: boolean; note: string }>({ live: false, note: "Modelled spread (slider)" });
+  const [convertBusy, setConvertBusy] = useState(false);
+
+  const loadFees = useCallback(async () => {
+    try {
+      const result = await getBybitFeeRates();
+      if (result.configured) {
+        setFeeRates(result.rates);
+        setFee(result.defaultTaker);
+        setFeeSource({ live: true, note: `Live account fee tier · ${Object.keys(result.rates).length} symbols` });
+      } else {
+        setFeeRates({});
+        setFeeSource({ live: false, note: result.reason });
+      }
+    } catch {
+      setFeeRates({});
+      setFeeSource({ live: false, note: "Fee tier unavailable — using the slider value" });
+    }
+  }, []);
+
   const scan = useCallback(async () => {
     setLoading(true);
     try {
@@ -445,21 +477,16 @@ function Scanner() {
     }
   }, []);
 
-  useEffect(() => { void scan(); }, [scan]);
-  useEffect(() => {
-    if (!autoRefresh) return;
-    const timer = window.setInterval(() => { if (!scanningRef.current) void scan(); }, REFRESH_MS);
-    return () => window.clearInterval(timer);
-  }, [autoRefresh, scan]);
+  useEffect(() => { void scan(); void loadFees(); }, [scan, loadFees]);
 
   // Scanning is manual: a request snapshot is only created when the user hits "Scan now".
   // Work is time-sliced so the tab stays responsive while a full-universe pass runs.
   const [opportunities, setOpportunities] = useState<Opportunity[]>([]);
   const [progress, setProgress] = useState({ done: 0, total: 0, assets: 0 });
-  type ScanRequest = { market: MarketResponse; fee: number; maxLegs: number; useConvert: boolean; convertSpread: number; universe: Universe; id: number };
+  type ScanRequest = { market: MarketResponse; fee: number; maxLegs: number; useConvert: boolean; convertSpread: number; universe: Universe; feeRates: Record<string, number>; id: number };
   const [scanRequest, setScanRequest] = useState<ScanRequest | null>(null);
 
-  const settings = { fee, maxLegs, useConvert, convertSpread, universe };
+  const settings = { fee, maxLegs, useConvert, convertSpread, universe, feeRates };
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
   const marketRef = useRef(market);
@@ -472,9 +499,40 @@ function Scanner() {
     setScanRequest({ market: source, ...settingsRef.current, id: Date.now() });
   }, [scan]);
 
+  // Auto refresh re-runs the full scan (not just the quote pull) so P/L stays current.
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const timer = window.setInterval(() => { if (!scanningRef.current) void runScan(); }, REFRESH_MS);
+    return () => window.clearInterval(timer);
+  }, [autoRefresh, runScan]);
+
+  /** Measure the real Convert spread against the spot mid using a live Bybit Convert quote. */
+  const calibrateConvert = useCallback(async () => {
+    const source = marketRef.current;
+    if (!source) return;
+    setConvertBusy(true);
+    try {
+      const ticker = source.tickers.find((item) => item.symbol === "BTCUSDT");
+      const mid = ticker ? (parseNumber(ticker.bid1Price) + parseNumber(ticker.ask1Price)) / 2 : 0;
+      const quote = await getBybitConvertQuote({ data: { fromCoin: "USDT", toCoin: "BTC", amount: 100 } });
+      if (!quote.ok || mid <= 0 || quote.rate <= 0) {
+        setConvertSource({ live: false, note: quote.ok ? "No spot reference for calibration" : quote.reason });
+        return;
+      }
+      const measured = Math.max(0, Math.min(0.05, 1 - quote.rate * mid));
+      setConvertSpread(measured);
+      setConvertSource({ live: true, note: `Live USDT→BTC Convert quote · ${(measured * 100).toFixed(3)}%` });
+    } catch {
+      setConvertSource({ live: false, note: "Convert quote unavailable — using the slider value" });
+    } finally {
+      setConvertBusy(false);
+    }
+  }, []);
+
+
   useEffect(() => {
     if (!scanRequest) return;
-    const pass = createScanPass(scanRequest.market.instruments, scanRequest.market.tickers, scanRequest.fee, scanRequest.maxLegs, scanRequest.useConvert, scanRequest.convertSpread, scanRequest.universe);
+    const pass = createScanPass(scanRequest.market.instruments, scanRequest.market.tickers, scanRequest.fee, scanRequest.maxLegs, scanRequest.useConvert, scanRequest.convertSpread, scanRequest.universe, scanRequest.feeRates);
     const total = pass.steps.length;
     const best = new Map<string, Opportunity>();
     let cursor = 0;
@@ -568,11 +626,12 @@ function Scanner() {
             <div className="space-y-5">
               <label className="block"><span className="mb-2 flex items-center justify-between text-xs font-medium text-foreground">Route universe <span className="font-mono text-muted-foreground">{copy.tag}</span></span><select className="select-control h-10 w-full rounded-md px-3 text-sm" value={universe} onChange={(event) => setUniverse(event.target.value as Universe)}><option value="crypto">Crypto only</option><option value="crypto-fiat">Crypto + fiat</option><option value="crypto-stocks">Crypto + stocks</option><option value="xstocks">xStocks only (USDT hub)</option><option value="cross">Cross-asset (crypto + stocks + fiat)</option></select></label>
               <label className="block"><span className="mb-2 flex items-center justify-between text-xs font-medium text-foreground">Minimum net profit <CircleHelp className="h-3.5 w-3.5 text-muted-foreground" /></span><div className="relative"><input className="input-control mono h-10 w-full rounded-md px-3 pr-10 text-sm" type="number" min="0" step="0.05" value={minProfit} onChange={(event) => setMinProfit(event.target.value)} /><span className="absolute right-3 top-2.5 font-mono text-xs text-muted-foreground">%</span></div></label>
-              <label className="block"><span className="mb-2 flex items-center justify-between text-xs font-medium text-foreground">Fee per leg <span className="font-mono text-muted-foreground">{(fee * 100).toFixed(2)}%</span></span><input className="w-full accent-primary" type="range" min="0" max="0.003" step="0.0001" value={fee} onChange={(event) => setFee(Number(event.target.value))} /></label>
+              <label className="block"><span className="mb-2 flex items-center justify-between text-xs font-medium text-foreground">Fee per leg <span className="font-mono text-muted-foreground">{(fee * 100).toFixed(3)}%</span></span><input className="w-full accent-primary" type="range" min="0" max="0.003" step="0.0001" value={fee} onChange={(event) => { setFee(Number(event.target.value)); setFeeRates({}); setFeeSource({ live: false, note: "Manual fee override" }); }} /><span className={`mt-1.5 block text-[11px] ${feeSource.live ? "text-primary" : "text-muted-foreground"}`}>{feeSource.note}</span></label>
               <label className="block"><span className="mb-2 flex items-center justify-between text-xs font-medium text-foreground">Max legs per cycle <span className="font-mono text-muted-foreground">{maxLegs}</span></span><select className="select-control h-10 w-full rounded-md px-3 text-sm" value={maxLegs} onChange={(event) => setMaxLegs(Number(event.target.value))}><option value={3}>3 legs</option><option value={4}>4 legs</option><option value={5}>5 legs (slow)</option></select></label>
               <div className="flex items-center justify-between border-t border-border pt-5"><div><div className="text-sm font-medium text-foreground">Bybit Convert legs</div><div className="mt-1 text-xs text-muted-foreground">{copy.convertLegs}</div></div><button aria-label="Toggle Bybit Convert legs" className="switch-track flex h-5 w-9 cursor-pointer items-center rounded-full p-0.5 transition-colors" data-on={useConvert} onClick={() => setUseConvert((value) => !value)}><span className="switch-thumb h-4 w-4 rounded-full transition-transform" /></button></div>
-              <label className={`block transition-opacity ${useConvert ? "" : "pointer-events-none opacity-40"}`}><span className="mb-2 flex items-center justify-between text-xs font-medium text-foreground">Convert spread <span className="font-mono text-muted-foreground">{(convertSpread * 100).toFixed(2)}%</span></span><input className="w-full accent-primary" type="range" min="0" max="0.01" step="0.0005" value={convertSpread} disabled={!useConvert} onChange={(event) => setConvertSpread(Number(event.target.value))} /></label>
-              <div className="flex items-center justify-between border-t border-border pt-5"><div><div className="text-sm font-medium text-foreground">Auto refresh</div><div className="mt-1 text-xs text-muted-foreground">Every 10 seconds</div></div><button aria-label="Toggle auto refresh" className="switch-track flex h-5 w-9 cursor-pointer items-center rounded-full p-0.5 transition-colors" data-on={autoRefresh} onClick={() => setAutoRefresh((value) => !value)}><span className="switch-thumb h-4 w-4 rounded-full transition-transform" /></button></div>
+              <label className={`block transition-opacity ${useConvert ? "" : "pointer-events-none opacity-40"}`}><span className="mb-2 flex items-center justify-between text-xs font-medium text-foreground">Convert spread <span className="font-mono text-muted-foreground">{(convertSpread * 100).toFixed(3)}%</span></span><input className="w-full accent-primary" type="range" min="0" max="0.01" step="0.0005" value={convertSpread} disabled={!useConvert} onChange={(event) => { setConvertSpread(Number(event.target.value)); setConvertSource({ live: false, note: "Manual spread override" }); }} /><span className={`mt-1.5 block text-[11px] ${convertSource.live ? "text-primary" : "text-muted-foreground"}`}>{convertSource.note}</span></label>
+              <Button variant="outline" size="sm" className="w-full" disabled={!useConvert || convertBusy || !market} onClick={() => void calibrateConvert()}><RefreshCw className={convertBusy ? "animate-spin" : ""} /> Measure live Convert spread</Button>
+              <div className="flex items-center justify-between border-t border-border pt-5"><div><div className="text-sm font-medium text-foreground">Auto refresh</div><div className="mt-1 text-xs text-muted-foreground">Rescans routes every 10 seconds</div></div><button aria-label="Toggle auto refresh" className="switch-track flex h-5 w-9 cursor-pointer items-center rounded-full p-0.5 transition-colors" data-on={autoRefresh} onClick={() => setAutoRefresh((value) => !value)}><span className="switch-thumb h-4 w-4 rounded-full transition-transform" /></button></div>
               <Button className="scan-button w-full" onClick={() => void runScan()} disabled={loading || scanning}><RefreshCw className={loading || scanning ? "animate-spin" : ""} /> {scanning ? "Scanning…" : "Scan now"}</Button>
             </div>
             <div className="mt-6 flex gap-2 rounded-md border border-warning/25 bg-warning/10 p-3 text-[11px] leading-4 text-warning"><Info className="mt-0.5 h-3.5 w-3.5 shrink-0" /><span>{useConvert ? <>Convert legs bridge coins that share no spot pair. Convert quotes are not public: legs are modelled at the USD reference mid minus the {(convertSpread * 100).toFixed(2)}% spread above, with no exchange fee. Real quotes may be wider, so verify each Convert leg before executing.</> : <>Convert legs are off, so routes are limited to coins connected by spot pairs. Enable Convert to search cycles that bridge unconnected coins.</>}</span></div>
@@ -589,6 +648,7 @@ function Scanner() {
       <RouteDetail
         opportunity={selected}
         fee={scanRequest?.fee ?? fee}
+        feeRates={scanRequest?.feeRates ?? feeRates}
         convertSpread={scanRequest?.convertSpread ?? convertSpread}
         fetchedAt={scanRequest?.market.fetchedAt ?? market?.fetchedAt}
         onClose={() => setSelected(null)}
@@ -621,7 +681,7 @@ function formatUsd(value: number) {
 }
 
 /** Detailed per-leg walkthrough of one route, simulated with a $1 notional. */
-function RouteDetail({ opportunity, fee, convertSpread, fetchedAt, onClose }: { opportunity: Opportunity | null; fee: number; convertSpread: number; fetchedAt?: string | undefined; onClose: () => void }) {
+function RouteDetail({ opportunity, fee, feeRates, convertSpread, fetchedAt, onClose }: { opportunity: Opportunity | null; fee: number; feeRates: Record<string, number>; convertSpread: number; fetchedAt?: string | undefined; onClose: () => void }) {
   if (!opportunity) return null;
   const start = opportunity.assets[0] ?? "";
 
@@ -630,7 +690,7 @@ function RouteDetail({ opportunity, fee, convertSpread, fetchedAt, onClose }: { 
   let balance = 1;
   const steps = opportunity.legs.map((leg) => {
     const rate = leg.side === "Buy" ? 1 / leg.price : leg.side === "Sell" ? leg.price : leg.price;
-    const cost = leg.side === "Convert" ? convertSpread : fee;
+    const cost = leg.side === "Convert" ? convertSpread : (feeRates[leg.symbol] ?? fee);
     const before = balance;
     const gross = before * rate;
     const charged = gross * cost;
