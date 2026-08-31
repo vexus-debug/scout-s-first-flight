@@ -3,6 +3,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { ArrowDown, ArrowUp, ChevronDown, CircleHelp, Clock3, ExternalLink, Gauge, GitBranch, Info, LayoutGrid, RefreshCw, Search, Settings2, SlidersHorizontal, Star, WalletCards, Zap } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { getBybitConvertQuote, getBybitFeeRates } from "@/lib/bybit.functions";
 
 type Instrument = {
   symbol: string;
